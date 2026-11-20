@@ -22,12 +22,136 @@ def _check_inputs(model, X, emissions, priors):
 	if X is None and emissions is None:
 		raise ValueError("Must pass in one of `X` or `emissions`.")
 
-	emissions = _check_parameter(_cast_as_tensor(emissions), "emissions", 
+	emissions = _check_parameter(_cast_as_tensor(emissions), "emissions",
 		ndim=3)
 	if emissions is None:
 		emissions = model._emission_matrix(X, priors=priors)
 
 	return emissions
+
+
+class FilteringState:
+	"""A resumable filtering state for streaming observations.
+
+	This object stores everything needed to continue the forward filter for a
+	batch of sequences when the observations arrive in blocks, without having
+	to re-run the entire prefix each time a new block arrives. It is created by
+	`DenseHMM.filtering_state` (or `SparseHMM.filtering_state`), extended by
+	calls to `filter`, and finalized by `finish_filtering`. Both HMM
+	implementations use the exact same contract.
+
+	The stored quantities are:
+
+		`alpha`: the *normalized* forward probability of the current
+			observation under each state. Each row sums to one, i.e. this is
+			the filtering distribution over states at the last observed time
+			step. Because it is normalized at every step, it does not
+			underflow on long sequences the way raw forward probabilities do.
+
+		`log_likelihood`: the cumulative log likelihood of every observation
+			block consumed so far, i.e. the sum of the log scaling terms
+			(log of the pre-normalization partition function at every step).
+			It equals `logsumexp` of the unnormalized forward vector at the
+			last time step. The unnormalized ("normalization-preserving")
+			forward log probabilities used by the regular `forward` method
+			can be reconstructed as `log(alpha) + log_likelihood` and are
+			available through the `log_forward` property.
+
+	The end probabilities are deliberately *not* applied while filtering:
+	they are multiplied in only once, when `finish_filtering` is called.
+	Consequently, filtering a sequence block by block and then finishing it
+	gives the same log probability as a single `log_probability` call on the
+	whole sequence.
+
+	A state is bound to the model that created it and cannot be shared between
+	models or across different sequence identities. It records the model's
+	parameter version, dtype/device, and state ordering. When the model
+	parameters are updated (e.g. via `from_summaries` or `add_edge`) the
+	version changes and the state is refused; the state must either be
+	discarded and replaced with a fresh one or explicitly re-bound with
+	`reset_filtering_state`. A state that has been finalized through
+	`finish_filtering` is closed and cannot be extended or reset.
+
+
+	Parameters
+	----------
+	model: _BaseHMM
+		The model that owns this state.
+
+	log_alpha: torch.Tensor, shape=(batch_size, n_distributions)
+		The normalized forward log probabilities at the current time step,
+		given as log values. Each row is a log probability distribution.
+
+	log_likelihood: torch.Tensor, shape=(batch_size,)
+		The cumulative log likelihood of all observations consumed so far.
+
+	sequence_ids: tuple
+		The identities of the sequences in the batch. Continuation calls must
+		present the same identities in the same order, which prevents blocks
+		from different sequences from being mixed into one state.
+	"""
+
+	def __init__(self, model, log_alpha, log_likelihood, sequence_ids):
+		self.model_name = model.name
+		self.k = model.n_distributions
+		self.dtype = log_alpha.dtype
+		self.device = log_alpha.device
+		self.parameter_version = model._parameter_version
+		# Store the actual distribution objects so that any reordering of the
+		# model's states is detected rather than silently misinterpreted.
+		self.state_order = tuple(model.distributions)
+
+		self._log_alpha = log_alpha.detach()
+		self._log_likelihood = log_likelihood.detach()
+		self.sequence_ids = tuple(sequence_ids)
+		self.closed = False
+
+	def __len__(self):
+		return len(self.sequence_ids)
+
+	@property
+	def batch_size(self):
+		"""The number of sequences represented by this state."""
+
+		return self._log_alpha.shape[0]
+
+	@property
+	def alpha(self):
+		"""The normalized forward probabilities at the current time step.
+
+		Returns a tensor of shape (batch_size, n_distributions) where every
+		row sums to one.
+		"""
+
+		return torch.exp(self._log_alpha)
+
+	@property
+	def log_alpha(self):
+		"""The log of the normalized forward probabilities."""
+
+		return self._log_alpha
+
+	@property
+	def log_likelihood(self):
+		"""The cumulative log likelihood of all consumed observations."""
+
+		return self._log_likelihood
+
+	@property
+	def log_forward(self):
+		"""The unnormalized forward log probabilities at the current step.
+
+		These are the same values the regular `forward` method would return
+		for the final time step of the consumed prefix: a log probability
+		mass over states that, in general, does not sum to one.
+		"""
+
+		return self._log_alpha + self._log_likelihood.unsqueeze(1)
+
+	def __repr__(self):
+		return ("{}({} sequences, {} states, log_likelihood={}, closed={})"
+			.format(self.model_name, self.batch_size, self.k,
+				self._log_likelihood.tolist(), self.closed))
 
 
 class Silent(Distribution):
@@ -178,6 +302,16 @@ class _BaseHMM(Distribution):
 
 		self.verbose = verbose
 		self.d = self.distributions[0].d if distributions is not None else None
+
+		# Monotonic counter bumped whenever the model parameters change.
+		# Filtering states bind to the version they were created with and are
+		# refused once the model has been updated underneath them.
+		self._parameter_version = 0
+
+	def _bump_parameter_version(self):
+		"""Invalidate all filtering states created before this point."""
+
+		self._parameter_version += 1
 
 	def _initialize(self, X=None, sample_weight=None):
 		"""Initialize the probability distribution.
@@ -719,6 +853,261 @@ class _BaseHMM(Distribution):
 			self._initialize(X, sample_weight=sample_weight)
 
 		return X, emissions, sample_weight
+
+	def _check_filtering_state(self, state):
+		"""Validate that a filtering state can be used with this model."""
+
+		if not isinstance(state, FilteringState):
+			raise ValueError("`state` must be a FilteringState returned by "
+				"`{}.filtering_state`.".format(self.name))
+
+		if state.model_name != self.name:
+			raise ValueError("This {} cannot consume a state created by a "
+				"{}.".format(self.name, state.model_name))
+
+		if state.k != self.n_distributions:
+			raise ValueError("The state was created for a model with {} "
+				"distributions but this model has {}.".format(state.k,
+					self.n_distributions))
+
+		if state.parameter_version != self._parameter_version:
+			raise ValueError("The model parameters have changed since this "
+				"state was created. Create a new filtering state or call "
+				"`reset_filtering_state` to explicitly rebind it.")
+
+		if state.dtype != self.dtype or state.device != self.device:
+			raise ValueError("The state was created with dtype {} on device "
+				"{} but the model now uses dtype {} on device {}. Create a "
+				"new filtering state or call `reset_filtering_state` to "
+				"explicitly rebind it.".format(state.dtype, state.device,
+					self.dtype, self.device))
+
+		if state.state_order != tuple(self.distributions):
+			raise ValueError("The ordering of the model's distributions has "
+				"changed since this state was created. Create a new "
+				"filtering state or call `reset_filtering_state` to "
+				"explicitly rebind it.")
+
+		if state.closed:
+			raise ValueError("This filtering state has already been closed "
+				"by `finish_filtering`; start a new sequence with "
+				"`filtering_state`.")
+
+	def filtering_state(self, X=None, emissions=None, priors=None,
+		sequence_ids=None):
+		"""Create a resumable filtering state for the first observation block.
+
+		This begins one or more new sequences. The start probabilities are
+		applied exactly once here; subsequent blocks must be passed to
+		`filter` together with the returned state, which continues the filter
+		without re-applying the starts and without re-processing any previous
+		observations. End probabilities are not applied until
+		`finish_filtering` is called.
+
+
+		Parameters
+		----------
+		X: list, numpy.ndarray, torch.Tensor, shape=(-1, -1, d)
+			The first block of observations. Does not need to be passed in if
+			`emissions` are.
+
+		emissions: torch.Tensor, shape=(-1, -1, n_distributions)
+			Precalculated emission log probabilities for the first block.
+
+		priors: list, numpy.ndarray, torch.Tensor, shape=(-1, -1, self.k)
+			Prior probabilities for assigning each symbol to each node.
+			Default is None.
+
+		sequence_ids: hashable, list, tuple or None, optional
+			The identities of the sequences in the batch. These are stored in
+			the state and must match, in order, on every continuation call so
+			that blocks belonging to different sequences can never be mixed
+			into the same state. Default is range(batch_size).
+
+
+		Returns
+		-------
+		state: FilteringState
+			A resumable state holding the normalized forward distribution and
+			the cumulative log likelihood of this first block.
+		"""
+
+		emissions = _check_inputs(self, X, emissions, priors)
+		if not self._initialized:
+			self._initialize()
+
+		n = emissions.shape[0]
+		if sequence_ids is None:
+			sequence_ids = tuple(range(n))
+		elif not isinstance(sequence_ids, (list, tuple)):
+			sequence_ids = (sequence_ids,)
+		else:
+			sequence_ids = tuple(sequence_ids)
+
+		if len(sequence_ids) != n:
+			raise ValueError("Expected {} sequence ids for a batch of {} "
+				"sequences but got {}.".format(n, n, len(sequence_ids)))
+
+		if len(set(sequence_ids)) != len(sequence_ids):
+			raise ValueError("Sequence ids must be unique within a batch.")
+
+		log_alpha = self.starts.unsqueeze(0) + emissions[:, 0]
+		log_scale = torch.logsumexp(log_alpha, dim=1, keepdims=True)
+		log_alpha = log_alpha - log_scale
+
+		log_likelihood = log_scale[:, 0]
+		if emissions.shape[1] > 1:
+			log_alpha, block_scale = self._scaled_forward_block(log_alpha,
+				emissions[:, 1:])
+			log_likelihood = log_likelihood + block_scale
+
+		state = FilteringState(self, log_alpha, log_likelihood, sequence_ids)
+		return state
+
+	def filter(self, state, X=None, emissions=None, priors=None,
+		sequence_ids=None):
+		"""Continue filtering from an existing state with a new block.
+
+		The observations in the block extend the sequences already represented
+		by `state`. Neither start probabilities nor end probabilities are
+		applied: the filter simply continues from the state's current
+		normalized forward distribution. This is mathematically identical to
+		running the forward algorithm over the concatenation of all blocks.
+
+
+		Parameters
+		----------
+		state: FilteringState
+			A state returned by `filtering_state` or a previous `filter` call.
+
+		X: list, numpy.ndarray, torch.Tensor, shape=(-1, -1, d)
+			The next block of observations. Does not need to be passed in if
+			`emissions` are.
+
+		emissions: torch.Tensor, shape=(-1, -1, n_distributions)
+			Precalculated emission log probabilities for the block.
+
+		priors: list, numpy.ndarray, torch.Tensor, shape=(-1, -1, self.k)
+			Prior probabilities for assigning each symbol to each node.
+			Default is None.
+
+		sequence_ids: hashable, list, tuple or None, optional
+			Must match, in order, the identities stored in the state. This
+			guarantees that a block cannot be pushed into a state belonging
+			to a different set of sequences. Default is None, which skips
+			the explicit check but still verifies the batch size.
+
+
+		Returns
+		-------
+		state: FilteringState
+			The same state, updated in place, holding the normalized forward
+			distribution and cumulative log likelihood after the new block.
+		"""
+
+		self._check_filtering_state(state)
+		emissions = _check_inputs(self, X, emissions, priors)
+
+		n = emissions.shape[0]
+		if n != state.batch_size:
+			raise ValueError("The state represents {} sequence(s) but the "
+				"new block contains {}.".format(state.batch_size, n))
+
+		if sequence_ids is not None:
+			if not isinstance(sequence_ids, (list, tuple)):
+				sequence_ids = (sequence_ids,)
+			else:
+				sequence_ids = tuple(sequence_ids)
+
+			if sequence_ids != state.sequence_ids:
+				raise ValueError("The sequence ids of the new block {} do "
+					"not match the state's sequence ids {}. Blocks from "
+					"different sequences cannot share a filtering state."
+					.format(sequence_ids, state.sequence_ids))
+
+		log_alpha, block_scale = self._scaled_forward_block(
+			state._log_alpha, emissions)
+		state._log_alpha = log_alpha
+		state._log_likelihood = state._log_likelihood + block_scale
+		return state
+
+	def finish_filtering(self, state):
+		"""Apply the end probabilities and return the sequence log likelihood.
+
+		This is the only place end probabilities enter the streaming
+		calculation. After this call the state is closed and cannot be
+		extended; the returned value equals a single `log_probability` call on
+		the full concatenated sequence.
+
+
+		Parameters
+		----------
+		state: FilteringState
+			A state returned by `filtering_state` and optionally extended with
+			`filter`.
+
+
+		Returns
+		-------
+		logp: torch.Tensor, shape=(batch_size,)
+			The log probability of each full sequence, including the end
+			probabilities.
+		"""
+
+		self._check_filtering_state(state)
+
+		logp = state._log_likelihood + torch.logsumexp(
+			state._log_alpha + self.ends, dim=1)
+		state.closed = True
+		return logp
+
+	def reset_filtering_state(self, state):
+		"""Explicitly rebind a state after the model parameters changed.
+
+		Filtering states are normally invalidated when the model parameters
+		are updated. Calling this method acknowledges that change and re-binds
+		the state to the current parameter version, dtype/device, and state
+		ordering without altering the stored filtering distribution or
+		cumulative log likelihood. A closed state cannot be reset.
+
+
+		Parameters
+		----------
+		state: FilteringState
+			The state to rebind to this model.
+
+
+		Returns
+		-------
+		state: FilteringState
+			The same state, updated in place.
+		"""
+
+		if not isinstance(state, FilteringState):
+			raise ValueError("`state` must be a FilteringState.")
+
+		if state.model_name != self.name:
+			raise ValueError("This {} cannot rebind a state created by a "
+				"{}.".format(self.name, state.model_name))
+
+		if state.closed:
+			raise ValueError("A closed filtering state cannot be reset; "
+				"start a new sequence with `filtering_state`.")
+
+		if state.k != self.n_distributions:
+			raise ValueError("Cannot rebind a state with {} states to a "
+				"model with {} distributions.".format(state.k,
+					self.n_distributions))
+
+		state._log_alpha = state._log_alpha.to(dtype=self.dtype,
+			device=self.device)
+		state._log_likelihood = state._log_likelihood.to(dtype=self.dtype,
+			device=self.device)
+		state.dtype = self.dtype
+		state.device = self.device
+		state.parameter_version = self._parameter_version
+		state.state_order = tuple(self.distributions)
+		return state
 
 	def from_summaries(self):
 		"""Update the model parameters given the extracted statistics.

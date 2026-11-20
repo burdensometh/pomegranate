@@ -79,6 +79,8 @@ Models
 
 .. autoclass:: pomegranate.hmm.SparseHMM
 
+.. autoclass:: pomegranate.hmm.FilteringState
+
 .. autoclass:: pomegranate.markov_chain.MarkovChain
 
 .. autoclass:: pomegranate.bayesian_network.BayesianNetwork

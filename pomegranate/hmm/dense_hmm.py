@@ -197,31 +197,40 @@ class DenseHMM(_BaseHMM):
 
 		n = self.n_distributions
 
+		def _index(node):
+			for idx, distribution in enumerate(self.distributions):
+				if node is distribution or node == distribution:
+					return idx
+			raise ValueError("Distribution is not part of this model.")
+
 		if start == self.start:
 			if self.starts is None:
-				self.starts = torch.empty(n, dtype=self.dtype, 
+				self.starts = torch.empty(n, dtype=self.dtype,
 					device=self.device) - inf
 
-			idx = self.distributions.index(end)
+			idx = _index(end)
 			self.starts[idx] = math.log(prob)
 
 		elif end == self.end:
 			if self.ends is None:
-				self.ends = torch.empty(n, dtype=self.dtype, 
+				self.ends = torch.empty(n, dtype=self.dtype,
 					device=self.device) - inf
 
-			idx = self.distributions.index(start)
+			idx = _index(start)
 			self.ends[idx] = math.log(prob)
 
 		else:
 			if self.edges is None:
-				self.edges = torch.empty((n, n), dtype=self.dtype, 
+				self.edges = torch.empty((n, n), dtype=self.dtype,
 					device=self.device) - inf
 
-			idx1 = self.distributions.index(start)
-			idx2 = self.distributions.index(end)
+			idx1 = _index(start)
+			idx2 = _index(end)
 
 			self.edges[idx1, idx2] = math.log(prob)
+
+		if self._initialized:
+			self._bump_parameter_version()
 
 	def sample(self, n):
 		"""Sample from the probability distribution.
@@ -409,6 +418,57 @@ class DenseHMM(_BaseHMM):
 
 		f = f.permute(1, 0, 2)
 		return f
+
+	def _scaled_forward_block(self, log_alpha, emissions):
+		"""Run the normalized forward recursion over one observation block.
+
+		This is the streaming counterpart of `forward`: instead of starting
+		from the start probabilities it starts from a normalized forward
+		distribution carried by a FilteringState and normalizes at every time
+		step, returning the per-step log scales that accumulate into the
+		sequence log likelihood. It never touches the start or end
+		probabilities, so concatenating blocks reproduces the full forward
+		pass exactly (up to floating point precision).
+
+
+		Parameters
+		----------
+		log_alpha: torch.Tensor, shape=(batch_size, n_distributions)
+			The normalized forward log probabilities at the last time step of
+			the preceding block.
+
+		emissions: torch.Tensor, shape=(batch_size, block_length, n_distributions)
+			The emission log probabilities of the new block.
+
+
+		Returns
+		-------
+		log_alpha: torch.Tensor, shape=(batch_size, n_distributions)
+			The normalized forward log probabilities after the block.
+
+		block_log_scale: torch.Tensor, shape=(batch_size,)
+			The sum of the log normalization scales over the block.
+		"""
+
+		n, l, _ = emissions.shape
+		t_max = self.edges.max()
+		t = torch.exp(self.edges - t_max)
+
+		block_log_scale = torch.zeros(n, dtype=log_alpha.dtype,
+			device=log_alpha.device)
+
+		for i in range(l):
+			p_max = torch.max(log_alpha, dim=1, keepdims=True).values
+			p = torch.exp(log_alpha - p_max)
+
+			log_z = torch.log(torch.matmul(p, t)) + p_max + t_max
+			log_alpha = log_z + emissions[:, i]
+
+			log_scale = torch.logsumexp(log_alpha, dim=1)
+			log_alpha = log_alpha - log_scale.unsqueeze(1)
+			block_log_scale = block_log_scale + log_scale
+
+		return log_alpha, block_log_scale
 
 	def backward(self, X=None, emissions=None, priors=None):
 		"""Run the backward algorithm on some data.
@@ -651,3 +711,4 @@ class DenseHMM(_BaseHMM):
 		_update_parameter(self.starts, starts, inertia=self.inertia)
 		_update_parameter(self.edges, edges, inertia=self.inertia)
 		self._reset_cache()
+		self._bump_parameter_version()

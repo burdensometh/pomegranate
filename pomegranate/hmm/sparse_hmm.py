@@ -489,6 +489,62 @@ class SparseHMM(_BaseHMM):
 		f = f.permute(1, 0, 2)
 		return f
 
+	def _scaled_forward_block(self, log_alpha, emissions):
+		"""Run the normalized forward recursion over one observation block.
+
+		This is the streaming counterpart of `forward`: instead of starting
+		from the start probabilities it starts from a normalized forward
+		distribution carried by a FilteringState and normalizes at every time
+		step, returning the per-step log scales that accumulate into the
+		sequence log likelihood. It never touches the start or end
+		probabilities, so concatenating blocks reproduces the full forward
+		pass exactly (up to floating point precision). It uses the same
+		sparse-edge scatter contract as `forward`.
+
+
+		Parameters
+		----------
+		log_alpha: torch.Tensor, shape=(batch_size, n_distributions)
+			The normalized forward log probabilities at the last time step of
+			the preceding block.
+
+		emissions: torch.Tensor, shape=(batch_size, block_length, n_distributions)
+			The emission log probabilities of the new block.
+
+
+		Returns
+		-------
+		log_alpha: torch.Tensor, shape=(batch_size, n_distributions)
+			The normalized forward log probabilities after the block.
+
+		block_log_scale: torch.Tensor, shape=(batch_size,)
+			The sum of the log normalization scales over the block.
+		"""
+
+		n, l, _ = emissions.shape
+
+		block_log_scale = torch.zeros(n, dtype=log_alpha.dtype,
+			device=log_alpha.device)
+
+		for i in range(l):
+			p = log_alpha[:, self._edge_idx_starts]
+			p = p + self._edge_log_probs.expand(n, -1)
+
+			alpha = torch.max(p, dim=1, keepdims=True).values
+			p = torch.exp(p - alpha)
+
+			z = torch.zeros((n, self.n_distributions), dtype=log_alpha.dtype,
+				device=log_alpha.device)
+			z.scatter_add_(1, self._edge_idx_ends.expand(n, -1), p)
+
+			log_alpha = alpha + torch.log(z) + emissions[:, i]
+
+			log_scale = torch.logsumexp(log_alpha, dim=1)
+			log_alpha = log_alpha - log_scale.unsqueeze(1)
+			block_log_scale = block_log_scale + log_scale
+
+		return log_alpha, block_log_scale
+
 	def backward(self, X=None, emissions=None, priors=None):
 		"""Run the backward algorithm on some data.
 
@@ -731,3 +787,4 @@ class SparseHMM(_BaseHMM):
 		_update_parameter(self._edge_log_probs, _edge_log_probs,
 			inertia=self.inertia)
 		self._reset_cache()
+		self._bump_parameter_version()
