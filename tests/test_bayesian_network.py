@@ -1,6 +1,8 @@
 # test_bayesian_network.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import itertools
+
 import numpy
 import torch
 import pytest
@@ -1141,3 +1143,149 @@ def test_summarize_weighted(X, w, distributions):
 		 [0.9211, 0.0789]], 4)
 	assert_array_almost_equal(model.distributions[3].probs, 
 		[[0.0952, 0.9048]], 4)
+
+
+###
+# Soft evidence (per-variable nonnegative likelihood vectors)
+###
+
+
+def _monty_hall_bn():
+	p = numpy.array([[
+		 [[0.0, 0.5, 0.5], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+		 [[0.0, 0.0, 1.0], [0.5, 0.0, 0.5], [1.0, 0.0, 0.0]],
+		 [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0]]
+	]])
+
+	d1 = Categorical([[1./3, 1./3, 1./3]])
+	d2 = Categorical([[1./3, 1./3, 1./3]])
+	d3 = ConditionalCategorical(p)
+
+	return BayesianNetwork([d1, d2, d3], [(d1, d3), (d2, d3)]), p
+
+
+def _unobserved(n, d=3):
+	return torch.masked.MaskedTensor(torch.zeros(n, d, dtype=torch.int64),
+		mask=torch.zeros(n, d, dtype=torch.bool))
+
+
+def _brute_force_bn(p, likelihoods):
+	n = next(e.shape[0] for e in likelihoods if e is not None)
+	joint = numpy.zeros((n, 3, 3, 3))
+	for c, g, mo in itertools.product(range(3), range(3), range(3)):
+		v = (1. / 3) * (1. / 3) * p[0, c, g, mo]
+		for j in range(n):
+			w = v
+			for i, val in enumerate((c, g, mo)):
+				if likelihoods[i] is not None:
+					w *= likelihoods[i][j, val]
+			joint[j, c, g, mo] = w
+
+	joint /= joint.sum(axis=(1, 2, 3), keepdims=True)
+	return [joint.sum(axis=(2, 3)), joint.sum(axis=(1, 3)),
+		joint.sum(axis=(1, 2))]
+
+
+def test_bn_soft_evidence_matches_brute_force():
+	model, p = _monty_hall_bn()
+	l0 = numpy.array([[0.7, 0.2, 0.1], [2.0, 1.0, 0.5]])
+
+	y_hat = model.predict_proba(_unobserved(2),
+		evidence=[torch.tensor(l0), None, None])
+	ref = _brute_force_bn(p, [l0, None, None])
+
+	for i in range(3):
+		assert_array_almost_equal(y_hat[i], ref[i], 5)
+
+
+def test_bn_soft_evidence_scale_invariance():
+	model, _ = _monty_hall_bn()
+	l0 = torch.tensor([[0.7, 0.2, 0.1], [2.0, 1.0, 0.5]])
+
+	y_hat = model.predict_proba(_unobserved(2), evidence=[l0, None, None])
+	y_scaled = model.predict_proba(_unobserved(2),
+		evidence=[l0 * 12.8, None, None])
+
+	for a, b in zip(y_hat, y_scaled):
+		assert_array_almost_equal(a, b, 6)
+
+
+def test_bn_soft_evidence_shared_contract():
+	# predict_proba, predict_log_proba and predict all take the same
+	# evidence argument and never reduce a soft vector to an argmax label.
+	model, _ = _monty_hall_bn()
+	l0 = torch.tensor([[0.99, 0.01, 0.0]])
+
+	y_hat = model.predict_proba(_unobserved(1), evidence=[l0, None, None])
+	log_hat = model.predict_log_proba(_unobserved(1),
+		evidence=[l0, None, None])
+	pred = model.predict(_unobserved(1), evidence=[l0, None, None])
+
+	assert_array_almost_equal(y_hat[0], [[0.99, 0.01, 0.0]])
+	assert_array_almost_equal(log_hat[0], numpy.log([[0.99, 0.01, 0.0]]), 5)
+	assert_array_equal(pred,
+		torch.vstack([t.argmax(dim=1) for t in y_hat]).T)
+
+	# The completion must differ from hard-evidence on category 0.
+	hard = torch.masked.MaskedTensor(torch.tensor([[0, 0, 0]]),
+		mask=torch.tensor([[True, False, False]]))
+	y_hard = model.predict_proba(hard)
+	assert not numpy.allclose(y_hard[0].numpy(), y_hat[0].numpy())
+
+
+def test_bn_soft_evidence_mixed_rows_and_completion():
+	# Different rows observe different variables: hard evidence in one row,
+	# soft evidence on another variable in another row.
+	model, p = _monty_hall_bn()
+
+	X = torch.tensor([[1, 0, 0], [0, 0, 0]])
+	mask = torch.tensor([[False, True, False],
+		[False, False, False]])
+	soft = torch.tensor([[0.5, 0.3, 0.2], [0.1, 0.1, 0.8]])
+
+	y_hat = model.predict_proba(torch.masked.MaskedTensor(X, mask=mask),
+		evidence=[soft, None, None])
+
+	# Row 0 hard-observes variable 1 at category 0, so it is clamped there.
+	assert_array_almost_equal(y_hat[1][0], [1.0, 0.0, 0.0])
+	ref = _brute_force_bn(p, [soft.numpy(), None, None])
+	assert_array_almost_equal(y_hat[0][1], ref[0][1], 5)
+
+	pred = model.predict(torch.masked.MaskedTensor(X, mask=mask),
+		evidence=[soft, None, None])
+	# Hard-observed cell is preserved; the others come from posterior argmax.
+	assert pred[0, 1] == 0
+	assert_array_equal(pred[:, 0].numpy(),
+		[t.argmax() for t in y_hat[0]])
+
+
+def test_bn_soft_evidence_raises():
+	model, _ = _monty_hall_bn()
+
+	# All-zero likelihood vector.
+	assert_raises(ValueError, model.predict_proba, _unobserved(1),
+		evidence=[None, torch.zeros(1, 3), None])
+
+	# Hard/soft conflict.
+	X = torch.masked.MaskedTensor(torch.tensor([[1, 0, 0]]),
+		mask=torch.tensor([[True, False, False]]))
+	assert_raises(ValueError, model.predict_proba, X,
+		evidence=[torch.tensor([[0.6, 0.0, 0.4]]), None, None])
+
+	# Bad evidence length.
+	assert_raises(ValueError, model.predict_proba, _unobserved(1),
+		evidence=[None, None])
+
+
+def test_bn_soft_evidence_does_not_mutate_model():
+	model, _ = _monty_hall_bn()
+	fg_before = [torch.clone(f.probs) for f in model._factor_graph.factors]
+	m_before = [torch.clone(m.probs) for m in model._factor_graph.marginals]
+
+	model.predict_proba(_unobserved(2), evidence=[
+		torch.tensor([[0.7, 0.2, 0.1], [2.0, 1.0, 0.5]]), None, None])
+
+	for f, b in zip(model._factor_graph.factors, fg_before):
+		assert torch.allclose(f.probs, b)
+	for m, b in zip(model._factor_graph.marginals, m_before):
+		assert torch.allclose(m.probs, b)

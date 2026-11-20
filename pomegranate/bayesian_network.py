@@ -355,7 +355,7 @@ class BayesianNetwork(Distribution):
 
 		return logps
 
-	def predict(self, X):
+	def predict(self, X, evidence=None):
 		"""Infers the maximum likelihood value for each missing value.
 
 		This method infers a probability distribution for each of the missing
@@ -369,7 +369,13 @@ class BayesianNetwork(Distribution):
 		are not observed (mask = False) for each of the values. When setting
 		mask = False, it does not matter what the corresponding value in the
 		tensor is. Different sets of variables can be observed or missing in
-		different examples. 
+		different examples.
+
+		Soft evidence may be supplied through `evidence` using the same
+		contract as `predict_proba`. The soft likelihood vectors are combined
+		with the hard evidence during message passing and are never converted
+		into hard labels first; the argmax is only taken on the inferred
+		posteriors for the missing-value completion.
 
 		Unlike the `predict_proba` and `predict_log_proba` methods, this
 		method preserves the dimensions of the original data because it does
@@ -381,8 +387,13 @@ class BayesianNetwork(Distribution):
 		----------
 		X: torch.masked.MaskedTensor, shape=(-1, d)
 			The data to predict values for. The mask should correspond to
-			whether the variable is observed in the example. 
-		
+			whether the variable is observed in the example.
+
+		evidence: list, tuple, or None, optional
+			Per-variable nonnegative likelihood vectors; see
+			`FactorGraph.predict_proba` for the full contract. Default is
+			None.
+
 
 		Returns
 		-------
@@ -392,31 +403,41 @@ class BayesianNetwork(Distribution):
 			the sum-product algorithm, and observed variables are kept.
 		"""
 
-		y = [t.argmax(dim=1) for t in self.predict_proba(X)]
+		y = [t.argmax(dim=1) for t in self.predict_proba(X, evidence)]
 		return torch.vstack(y).T.contiguous()
 
-	def predict_proba(self, X):
+	def predict_proba(self, X, evidence=None):
 		"""Infers the probability of each category given the model and data.
 
-		This method infers a probability distribution for each of the missing 
+		This method infers a probability distribution for each of the missing
 		values in the data. It uses the factor graph representation of the
 		Bayesian network to run the sum-product/loopy belief propagation
 		algorithm.
 
-		The input to this method must be a torch.masked.MaskedTensor where the
+		The hard evidence must be a torch.masked.MaskedTensor where the
 		mask specifies which variables are observed (mask = True) and which ones
 		are not observed (mask = False) for each of the values. When setting
 		mask = False, it does not matter what the corresponding value in the
 		tensor is. Different sets of variables can be observed or missing in
-		different examples. 
+		different examples.
+
+		Soft evidence can be supplied through `evidence`: one entry per
+		variable, either None or a nonnegative likelihood vector over that
+		variable's categories. The likelihood vectors participate in message
+		passing together with the hard evidence but only affect this
+		inference; the model's probability tables are never modified. A soft
+		vector is never collapsed into its argmax: all categories keep their
+		relative credibility. Hard/soft conflicts and all-zero likelihood
+		vectors raise a ValueError, and any positive common multiple of a
+		likelihood vector gives the same posterior.
 
 		An important note is that, because each variable can have a different
 		number of categories in the categorical setting, the return is a list
 		of tensors where each element in that list is the marginal probability
 		distribution for that variable. More concretely: the first element will
 		be the distribution of values for the first variable across all
-		examples. When the first variable has been provided as evidence, the
-		distribution will be clamped to the value provided as evidence.
+		examples. When the first variable has been provided as hard evidence,
+		the distribution will be clamped to the value provided as evidence.
 
 		..warning:: This inference is exact given a Bayesian network that has
 		a tree-like structure, but is only approximate for other cases. When
@@ -428,8 +449,14 @@ class BayesianNetwork(Distribution):
 		----------
 		X: torch.masked.MaskedTensor, shape=(-1, d)
 			The data to predict values for. The mask should correspond to
-			whether the variable is observed in the example. 
-		
+			whether the variable is observed in the example.
+
+		evidence: list, tuple, or None, optional
+			One entry per variable. An entry of None means no soft evidence
+			for that variable; otherwise it is a nonnegative likelihood
+			tensor of shape (n, n_keys), or shape (n_keys,) when one vector
+			is reused for every row. Default is None.
+
 
 		Returns
 		-------
@@ -438,55 +465,37 @@ class BayesianNetwork(Distribution):
 			values for that dimension.
 		"""
 
-		return self._factor_graph.predict_proba(X)
+		return self._factor_graph.predict_proba(X, evidence)
 
-	def predict_log_proba(self, X):
-		"""Infers the probability of each category given the model and data.
+	def predict_log_proba(self, X, evidence=None):
+		"""Infers the log probability of each category given evidence.
 
 		This method is a wrapper around the `predict_proba` method and simply
-		takes the log of each returned tensor.
-
-		This method infers a log probability distribution for each of the 
-		missing  values in the data. It uses the factor graph representation of 
-		the Bayesian network to run the sum-product/loopy belief propagation
-		algorithm.
-
-		The input to this method must be a torch.masked.MaskedTensor where the
-		mask specifies which variables are observed (mask = True) and which ones
-		are not observed (mask = False) for each of the values. When setting
-		mask = False, it does not matter what the corresponding value in the
-		tensor is. Different sets of variables can be observed or missing in
-		different examples. 
-
-		An important note is that, because each variable can have a different
-		number of categories in the categorical setting, the return is a list
-		of tensors where each element in that list is the marginal probability
-		distribution for that variable. More concretely: the first element will
-		be the distribution of values for the first variable across all
-		examples. When the first variable has been provided as evidence, the
-		distribution will be clamped to the value provided as evidence.
-
-		..warning:: This inference is exact given a Bayesian network that has
-		a tree-like structure, but is only approximate for other cases. When
-		the network is acyclic, this procedure will converge, but if the graph
-		contains cycles then there is no guarantee on convergence.
+		takes the log of each returned tensor. The hard and soft evidence
+		share the same contract as `predict_proba`: soft likelihood vectors
+		participate in message passing and are never argmaxed into hard
+		labels.
 
 
 		Parameters
 		----------
 		X: torch.masked.MaskedTensor, shape=(-1, d)
 			The data to predict values for. The mask should correspond to
-			whether the variable is observed in the example. 
-		
+			whether the variable is observed in the example.
+
+		evidence: list, tuple, or None, optional
+			Per-variable nonnegative likelihood vectors; see
+			`predict_proba` for the full contract. Default is None.
+
 
 		Returns
 		-------
 		y: list of tensors, shape=(d,)
-			A list of tensors where each tensor contains the distribution of
-			values for that dimension.
+			A list of tensors where each tensor contains the log distribution
+			of values for that dimension.
 		"""
 
-		return [torch.log(t) for t in self.predict_proba(X)]
+		return [torch.log(t) for t in self.predict_proba(X, evidence)]
 
 	def fit(self, X, sample_weight=None):
 		"""Fit the model to optionally weighted examples.

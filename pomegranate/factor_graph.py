@@ -193,6 +193,118 @@ class FactorGraph(Distribution):
 
 		self.d += 1
 
+	def _check_evidence(self, X, evidence=None):
+		"""Validate hard and soft evidence and return per-variable likelihoods.
+
+		Hard evidence is given through a masked tensor, as before. Soft
+		evidence is given, per variable, as a matrix of nonnegative likelihood
+		vectors with one entry per category. The two forms share a single
+		contract:
+
+			- `evidence` is a list/tuple with one entry per marginal. An entry
+			  of None means that no soft evidence is supplied for that variable.
+			- Each non-None entry has shape (n, n_keys) for that variable, or
+			  shape (n_keys,) when the same likelihood vector applies to every
+			  row, and every value must be nonnegative.
+			- An all-zero likelihood vector is invalid because it rules out
+			  every category, so it raises a ValueError naming the bad rows.
+			- When a variable carries both hard evidence and a soft likelihood
+			  vector in the same row, the hard-observed category must have a
+			  positive likelihood. Otherwise the two forms of evidence
+			  conflict and a ValueError is raised.
+
+		Soft evidence only parameterizes this inference call; nothing is
+		written back to the marginal nodes or to the factor probability
+		tables. Likelihood vectors are only defined up to a positive common
+		multiple, so the vectors are normalized before message passing and
+		scaling a vector by any positive constant leaves the posterior
+		unchanged.
+
+
+		Parameters
+		----------
+		X: torch.masked.MaskedTensor, shape=(-1, d)
+			The hard evidence. Masked-in values are observed categories and
+			masked-out values are missing.
+
+		evidence: list, tuple, or None, optional
+			One entry per marginal. Each entry is None or a nonnegative
+			likelihood tensor of shape (n, n_keys) (or (n_keys,)). Default
+			is None.
+
+
+		Returns
+		-------
+		likelihoods: list of torch.Tensor or None
+			A per-variable list where each entry is either None or a
+			normalized likelihood tensor of shape (n, n_keys).
+		"""
+
+		if not isinstance(X, torch.masked.MaskedTensor):
+			raise TypeError("X must be a torch.masked.MaskedTensor where the "
+				"mask indicates which variables are observed.")
+
+		n, nm = X.shape
+		if nm != len(self.marginals):
+			raise ValueError("X.shape[1] must match the number of marginals.")
+
+		if evidence is None:
+			evidence = [None] * nm
+
+		if not isinstance(evidence, (list, tuple)) or len(evidence) != nm:
+			raise ValueError("evidence must be a list or tuple with one entry "
+				"per marginal, expected length {} but got length {}.".format(
+					nm, 0 if evidence is None else len(evidence)))
+
+		likelihoods = []
+		for i, e in enumerate(evidence):
+			n_keys = self.marginals[i].probs.shape[-1]
+
+			if e is None:
+				likelihoods.append(None)
+				continue
+
+			e = _cast_as_tensor(e, dtype=torch.float32)
+			if e.ndim == 1:
+				e = e.unsqueeze(0).expand(n, -1)
+			elif e.ndim != 2:
+				raise ValueError("evidence[{}] must have shape ({}, {}) or "
+					"({},).".format(i, n, n_keys, n_keys))
+
+			_check_parameter(e, "evidence[{}]".format(i), min_value=0.0,
+				ndim=2, shape=(n, n_keys), check_parameter=self.check_data)
+
+			zero_rows = (e > 0).sum(dim=1) == 0
+			if zero_rows.any():
+				rows = torch.nonzero(zero_rows, as_tuple=False).flatten()
+				raise ValueError("Soft evidence for variable {} contains an "
+					"all-zero likelihood vector in row(s) {}. Every "
+					"likelihood vector must have at least one positive "
+					"entry.".format(i, rows.tolist()))
+
+			likelihoods.append(e / e.sum(dim=1, keepdims=True))
+
+		# Check that hard evidence does not conflict with soft evidence:
+		# a hard-observed category must retain positive likelihood.
+		hard_mask = X._masked_mask
+		hard_data = X._masked_data
+		for i, e in enumerate(likelihoods):
+			if e is None or not hard_mask[:, i].any():
+				continue
+
+			observed = hard_mask[:, i]
+			values = hard_data[observed, i].long()
+			compat = e[observed, :].gather(1, values.unsqueeze(1)).squeeze(1)
+			conflicting = compat == 0
+			if conflicting.any():
+				rows = torch.nonzero(observed, as_tuple=False).flatten()
+				raise ValueError("Hard and soft evidence for variable {} "
+					"conflict in row(s) {}: the hard-observed category has "
+					"zero likelihood.".format(i,
+						rows[conflicting].tolist()))
+
+		return likelihoods
+
 	def add_edge(self, marginal, factor):
 		"""Adds an undirected edge to the set of edges.
 
@@ -252,7 +364,7 @@ class FactorGraph(Distribution):
 
 		return logps
 
-	def predict(self, X):
+	def predict(self, X, evidence=None):
 		"""Infers the maximum likelihood value for each missing value.
 
 		This method infers a probability distribution for each of the missing
@@ -265,7 +377,13 @@ class FactorGraph(Distribution):
 		are not observed (mask = False) for each of the values. When setting
 		mask = False, it does not matter what the corresponding value in the
 		tensor is. Different sets of variables can be observed or missing in
-		different examples. 
+		different examples.
+
+		Soft evidence may be supplied through `evidence` using the same
+		contract as `predict_proba`. The soft vectors are used to compute the
+		posteriors and are never turned into hard labels beforehand; the
+		argmax below is taken only on the resulting posteriors for the
+		missing-value completion.
 
 		Unlike the `predict_proba` and `predict_log_proba` methods, this
 		method preserves the dimensions of the original data because it does
@@ -278,15 +396,19 @@ class FactorGraph(Distribution):
 		X: torch.masked.MaskedTensor
 			A masked tensor where the observed values are available and the
 			unobserved values are missing, i.e., the mask is True for
-			observed values and the mask is False for missing values. It does
-			not matter what the underlying value in the tensor is for the 
+			observed values and is False for missing values. It does not
+			matter what the underlying value in the tensor is for the
 			missing values.
+
+		evidence: list, tuple, or None, optional
+			Per-variable nonnegative likelihood vectors; see
+			`predict_proba` for the full contract. Default is None.
 		"""
 
-		y = [t.argmax(dim=1) for t in self.predict_proba(X)]
+		y = [t.argmax(dim=1) for t in self.predict_proba(X, evidence)]
 		return torch.vstack(y).T.contiguous()
 
-	def predict_proba(self, X):
+	def predict_proba(self, X, evidence=None):
 		"""Predict the probability of each variable given some evidence.
 
 		Given some evidence about the value that each variable takes, infer
@@ -294,9 +416,25 @@ class FactorGraph(Distribution):
 		this returns the marginal value of each variable given the dependence
 		structure in the network.
 
-		Currently, only hard evidence is supported, where the evidence takes
-		the form of a discrete value. The evidence is represented as a
-		masked tensor where the masked out values are considered missing.
+		Two forms of evidence are supported and can be combined:
+
+			- Hard evidence takes the form of a masked tensor where masked-in
+			  values are observed discrete categories and masked-out values
+			  are missing.
+			- Soft evidence takes the form, per variable, of a nonnegative
+			  likelihood vector that assigns a relative credibility to each
+			  category. These vectors are passed in through `evidence` and
+			  participate in message passing alongside the hard evidence.
+			  They are not converted into hard labels: the full vector is
+			  used, even when one entry is much larger than the others, and
+			  nothing is written back to the model's probability tables.
+
+		Different rows can observe different variables, and a variable may
+		carry hard evidence in some rows and soft evidence in others. Hard
+		and soft evidence for the same variable in the same row must not
+		conflict, and an all-zero likelihood vector is rejected; see
+		`_check_evidence` for the full contract. Any positive common multiple
+		of a likelihood vector yields the same posterior.
 
 
 		Parameters
@@ -304,16 +442,23 @@ class FactorGraph(Distribution):
 		X: torch.masked.MaskedTensor
 			A masked tensor where the observed values are available and the
 			unobserved values are missing, i.e., the mask is True for
-			observed values and the mask is False for missing values. It does
-			not matter what the underlying value in the tensor is for the 
+			observed values and is False for missing values. It does not
+			matter what the underlying value in the tensor is for the
 			missing values.
+
+		evidence: list, tuple, or None, optional
+			One entry per marginal variable. An entry of None means no soft
+			evidence for that variable. Otherwise the entry is a nonnegative
+			tensor of likelihoods with shape (n, n_keys), or shape
+			(n_keys,) when one vector is reused for every row. Default is
+			None.
 		"""
 
 		nm = len(self.marginals)
 		nf = len(self.factors)
 
-		if X.shape[1] != nm:
-			raise ValueError("X.shape[1] must match the number of marginals.")
+		likelihoods = self._check_evidence(X, evidence)
+		n = X.shape[0]
 
 		# Pull out the current distributions from factors and marginals
 		factors = []
@@ -323,15 +468,23 @@ class FactorGraph(Distribution):
 
 		for i, m in enumerate(self.marginals):
 			p = torch.clone(m.probs[0])
-			p = p.repeat((X.shape[0],) + tuple(1 for _ in p.shape))
+			p = p.repeat((n,) + tuple(1 for _ in p.shape))
 
-			# Use the evidence in the data to set marginal distributions
-			for j in range(X.shape[0]):
+			# Use the hard evidence in the data to set marginal distributions
+			for j in range(n):
 				if X._masked_mask[j, i] == True:
 					value = X._masked_data[j, i]
 
 					p[j] = 0
 					p[j, value] = 1.0
+
+			# Incorporate the soft evidence as a likelihood over categories.
+			# The likelihood is multiplied in rather than replacing the
+			# marginal, so hard evidence is never derived from an argmax and
+			# the relative credibility of every category is retained.
+			if likelihoods[i] is not None:
+				p = p * likelihoods[i].to(p.device)
+				p = p / p.sum(dim=1, keepdims=True)
 
 			marginals.append(p)
 			prior_marginals.append(torch.clone(p))
@@ -343,7 +496,7 @@ class FactorGraph(Distribution):
 			else:
 				p = torch.clone(f.probs[0])
 
-			p = p.repeat((X.shape[0],) + tuple(1 for _ in p.shape))
+			p = p.repeat((n,) + tuple(1 for _ in p.shape))
 			factors.append(p)
 
 		# Set the original in and out messages along the edges
@@ -377,7 +530,7 @@ class FactorGraph(Distribution):
 					message = torch.clone(f)
 
 					shape = torch.ones(len(message.shape), dtype=torch.int32)
-					shape[0] = X.shape[0]
+					shape[0] = n
 
 					for l in range(ni_edges):
 						if k == l:
@@ -453,53 +606,35 @@ class FactorGraph(Distribution):
 
 		return current_marginals
 
-	def predict_log_proba(self, X):
-		"""Infers the probability of each category given the model and data.
+	def predict_log_proba(self, X, evidence=None):
+		"""Infers the log probability of each category given evidence.
 
 		This method is a wrapper around the `predict_proba` method and simply
-		takes the log of each returned tensor.
-
-		This method infers a log probability distribution for each of the 
-		missing  values in the data. It uses the factor graph representation of 
-		the Bayesian network to run the sum-product/loopy belief propagation
-		algorithm.
-
-		The input to this method must be a torch.masked.MaskedTensor where the
-		mask specifies which variables are observed (mask = True) and which ones
-		are not observed (mask = False) for each of the values. When setting
-		mask = False, it does not matter what the corresponding value in the
-		tensor is. Different sets of variables can be observed or missing in
-		different examples. 
-
-		An important note is that, because each variable can have a different
-		number of categories in the categorical setting, the return is a list
-		of tensors where each element in that list is the marginal probability
-		distribution for that variable. More concretely: the first element will
-		be the distribution of values for the first variable across all
-		examples. When the first variable has been provided as evidence, the
-		distribution will be clamped to the value provided as evidence.
-
-		..warning:: This inference is exact given a Bayesian network that has
-		a tree-like structure, but is only approximate for other cases. When
-		the network is acyclic, this procedure will converge, but if the graph
-		contains cycles then there is no guarantee on convergence.
+		takes the log of each returned tensor. The hard and soft evidence
+		follow the same shared contract as `predict_proba`: soft likelihood
+		vectors participate in message passing and are not argmaxed into hard
+		labels.
 
 
 		Parameters
 		----------
 		X: torch.masked.MaskedTensor, shape=(-1, d)
 			The data to predict values for. The mask should correspond to
-			whether the variable is observed in the example. 
-		
+			whether the variable is observed in the example.
+
+		evidence: list, tuple, or None, optional
+			Per-variable nonnegative likelihood vectors; see
+			`predict_proba` for the full contract. Default is None.
+
 
 		Returns
 		-------
 		y: list of tensors, shape=(d,)
-			A list of tensors where each tensor contains the distribution of
-			values for that dimension.
+			A list of tensors where each tensor contains the log distribution
+			of values for that dimension.
 		"""
 
-		return [torch.log(t) for t in self.predict_proba(X)]
+		return [torch.log(t) for t in self.predict_proba(X, evidence)]
 
 	def fit(self, X, sample_weight=None):
 		"""Fit the factors of the model to optionally weighted examples.
