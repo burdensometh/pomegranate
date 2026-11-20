@@ -19,6 +19,79 @@ SQRT_2_PI = 2.50662827463
 LOG_2_PI = 1.83787706641
 
 
+def _safe_cholesky(covs):
+	"""Return a lower-triangular Cholesky factor of a (possibly degenerate) cov.
+
+	When the covariance matrix is not positive definite it is regularized with
+	an increasing amount of diagonal jitter before the factorization is retried.
+	This makes the handling of degenerate covariance matrices explicit instead
+	of silently producing linear-algebra errors. If the factorization still
+	fails after several retries the Moore-Penrose pseudo-inverse based factor is
+	returned so that the calculation can proceed.
+
+
+	Parameters
+	----------
+	covs: torch.Tensor, shape=(d, d)
+		The covariance matrix to factorize.
+
+
+	Returns
+	-------
+	L: torch.Tensor, shape=(d, d)
+		A lower-triangular matrix such that L @ L.T approximates `covs`.
+	"""
+
+	try:
+		return torch.linalg.cholesky(covs)
+	except Exception:
+		pass
+
+	eye = torch.eye(covs.shape[0], dtype=covs.dtype, device=covs.device)
+	diag = torch.diagonal(covs)
+	scale = torch.maximum(diag.max(), torch.tensor(1.0, dtype=covs.dtype,
+		device=covs.device))
+
+	for jitter in (1e-6, 1e-4, 1e-2, 1e-1):
+		try:
+			return torch.linalg.cholesky(covs + jitter * scale * eye)
+		except Exception:
+			pass
+
+	# Final fallback: a factor built from the pseudo-inverse square root. This
+	# path is only reached when every jittered factorization has failed.
+	inv = torch.linalg.pinv(covs)
+	L_inv = torch.linalg.cholesky(0.5 * (inv + inv.T) + 1e-6 * scale * eye)
+	return torch.linalg.inv(L_inv).T
+
+
+def _mask_patterns(mask):
+	"""Group the rows of a mask by their observed-feature pattern.
+
+	The Cholesky factorizations of the marginal and conditional covariance
+	matrices depend only on which features are observed, not on the observed
+	values themselves. Hence, rows sharing a mask pattern can reuse a single
+	set of factorizations.
+
+
+	Parameters
+	----------
+	mask: torch.Tensor, shape=(n, d), dtype=torch.bool
+		A boolean tensor where True indicates an observed feature.
+
+
+	Returns
+	-------
+	patterns: torch.Tensor, shape=(p, d), dtype=torch.int8
+		The unique observed-feature patterns, one row per pattern.
+
+	inverse: torch.Tensor, shape=(n,), dtype=torch.long
+		The index of the pattern associated with each row of `mask`.
+	"""
+
+	return torch.unique(mask.to(torch.int8), dim=0, return_inverse=True)
+
+
 class Normal(Distribution):
 	"""A normal distribution object.
 
@@ -34,6 +107,16 @@ class Normal(Distribution):
 	used. The second is to not pass in the rate parameters and then call
 	either `fit` or `summary` + `from_summaries`, at which point the probability
 	parameter will be learned from data.
+
+	Missing values are supported through `torch.masked.MaskedTensor` inputs,
+	where `mask=True` marks an observed feature and `mask=False` marks a
+	missing one. For full-covariance distributions the marginal likelihood is
+	evaluated on the observed features only, rows that are entirely missing
+	contribute a log probability of zero (i.e. carry no information beyond the
+	priors), and during training the conditional mean and conditional covariance
+	of the missing features given the observed ones are folded into the
+	sufficient statistics used by the EM algorithm. Missing entries are never
+	replaced with zeros and treated as observations.
 
 
 	Parameters
@@ -51,7 +134,7 @@ class Normal(Distribution):
 
 	covariance_type: str, optional
 		The type of covariance matrix. Must be one of 'full', 'diag', or
-		'sphere'. Default is 'full'. 
+		'sphere'. Default is 'full'.
 
 	min_cov: float or None, optional
 		The minimum variance or covariance.
@@ -70,14 +153,14 @@ class Normal(Distribution):
 		parameter directly. Default is False.
 	"""
 
-	def __init__(self, means=None, covs=None, covariance_type='full', 
+	def __init__(self, means=None, covs=None, covariance_type='full',
 		min_cov=None, inertia=0.0, frozen=False, check_data=True):
 		super().__init__(inertia=inertia, frozen=frozen, check_data=check_data)
 		self.name = "Normal"
 
-		self.means = _check_parameter(_cast_as_parameter(means), "means", 
+		self.means = _check_parameter(_cast_as_parameter(means), "means",
 			ndim=1)
-		self.covs = _check_parameter(_cast_as_parameter(covs), "covs", 
+		self.covs = _check_parameter(_cast_as_parameter(covs), "covs",
 			ndim=(1, 2))
 
 		_check_shapes([self.means, self.covs], ["means", "covs"])
@@ -105,9 +188,9 @@ class Normal(Distribution):
 
 		self.means = _cast_as_parameter(torch.zeros(d, dtype=self.dtype,
 			device=self.device))
-		
+
 		if self.covariance_type == 'full':
-			self.covs = _cast_as_parameter(torch.zeros(d, d, 
+			self.covs = _cast_as_parameter(torch.zeros(d, d,
 				dtype=self.dtype, device=self.device))
 		elif self.covariance_type == 'diag':
 			self.covs = _cast_as_parameter(torch.zeros(d, dtype=self.dtype,
@@ -131,19 +214,19 @@ class Normal(Distribution):
 		if self._initialized == False:
 			return
 
-		self.register_buffer("_w_sum", torch.zeros(self.d, dtype=self.dtype, 
+		self.register_buffer("_w_sum", torch.zeros(self.d, dtype=self.dtype,
 			device=self.device))
 		self.register_buffer("_xw_sum", torch.zeros(self.d, dtype=self.dtype,
 			device=self.device))
 
 		if self.covariance_type == 'full':
-			self.register_buffer("_xxw_sum", torch.zeros(self.d, self.d, 
+			self.register_buffer("_xxw_sum", torch.zeros(self.d, self.d,
 				dtype=self.dtype, device=self.device))
 
 			if self.covs.sum() > 0.0:
-				chol = torch.linalg.cholesky(self.covs)
+				chol = _safe_cholesky(self.covs)
 				_inv_cov = torch.linalg.solve_triangular(chol, torch.eye(
-					len(self.covs), dtype=self.dtype, device=self.device), 
+					len(self.covs), dtype=self.dtype, device=self.device),
 					upper=False).T
 				_inv_cov_dot_mu = torch.matmul(self.means, _inv_cov)
 				_log_det = -0.5 * torch.linalg.slogdet(self.covs)[1]
@@ -155,11 +238,11 @@ class Normal(Distribution):
 				self.register_buffer("_theta", _theta)
 
 		elif self.covariance_type in ('diag', 'sphere'):
-			self.register_buffer("_xxw_sum", torch.zeros(self.d, 
+			self.register_buffer("_xxw_sum", torch.zeros(self.d,
 				dtype=self.dtype, device=self.device))
 
 			if self.covs.sum() > 0.0:
-				_log_sigma_sqrt_2pi = -torch.log(torch.sqrt(self.covs) * 
+				_log_sigma_sqrt_2pi = -torch.log(torch.sqrt(self.covs) *
 					SQRT_2_PI)
 				_inv_two_sigma = 1. / (2 * self.covs)
 
@@ -180,7 +263,7 @@ class Normal(Distribution):
 		----------
 		n: int
 			The number of samples to generate.
-		
+
 
 		Returns
 		-------
@@ -191,7 +274,7 @@ class Normal(Distribution):
 		if self.covariance_type == 'diag':
 			return torch.distributions.Normal(self.means, self.covs).sample([n])
 		elif self.covariance_type == 'full':
-			return torch.distributions.MultivariateNormal(self.means, 
+			return torch.distributions.MultivariateNormal(self.means,
 				self.covs).sample([n])
 
 	def log_probability(self, X):
@@ -200,6 +283,15 @@ class Normal(Distribution):
 		This method calculates the log probability of each example given the
 		parameters of the distribution. The examples must be given in a 2D
 		format.
+
+		When a `torch.masked.MaskedTensor` is provided, the mask determines
+		which features are observed for each example. For full-covariance
+		distributions, the marginal distribution over the observed features is
+		evaluated separately for each distinct mask pattern, reusing the
+		factorization within a pattern. Rows without any observed features get
+		a log probability of zero because an empty observation carries no
+		information; observed values are always used as-is and missing values
+		are never filled in with zeros.
 
 		Note: This differs from some other log probability calculation
 		functions, like those in torch.distributions, because it is not
@@ -210,7 +302,7 @@ class Normal(Distribution):
 		Parameters
 		----------
 		X: list, tuple, numpy.ndarray, torch.Tensor, shape=(-1, self.d)
-			A set of examples to evaluate.
+			A set of examples to evaluate, optionally as a masked tensor.
 
 
 		Returns
@@ -219,18 +311,63 @@ class Normal(Distribution):
 			The log probability of each example.
 		"""
 
-		X = _check_parameter(_cast_as_tensor(X, dtype=self.means.dtype), "X", 
+		X = _check_parameter(_cast_as_tensor(X, dtype=self.means.dtype), "X",
 			ndim=2, shape=(-1, self.d), check_parameter=self.check_data)
 
-		if self.covariance_type == 'full':
-			logp = torch.matmul(X, self._inv_cov) - self._inv_cov_dot_mu
-			logp = self.d * LOG_2_PI + torch.sum(logp ** 2, dim=-1)
-			logp = self._log_det - 0.5 * logp
+		if not isinstance(X, torch.masked.MaskedTensor):
+			if self.covariance_type == 'full':
+				logp = torch.matmul(X, self._inv_cov) - self._inv_cov_dot_mu
+				logp = self.d * LOG_2_PI + torch.sum(logp ** 2, dim=-1)
+				logp = self._log_det - 0.5 * logp
+				return logp
+
+			elif self.covariance_type in ('diag', 'sphere'):
+				return torch.sum(self._log_sigma_sqrt_2pi -
+					((X - self.means) ** 2) * self._inv_two_sigma, dim=-1)
+
+		mask = X._masked_mask
+		data = X._masked_data
+		n, d = mask.shape
+
+		if self.covariance_type in ('diag', 'sphere'):
+			# Features are independent, so missing features can simply be
+			# skipped: masked arithmetic ignores the unobserved coordinates,
+			# giving exactly the marginal log probability of the observed
+			# coordinates. The result stays masked for rows without any
+			# observation so that they do not pretend to carry evidence.
+			logp = torch.sum(self._log_sigma_sqrt_2pi -
+				((X - self.means) ** 2) * self._inv_two_sigma, dim=-1)
 			return logp
-		
-		elif self.covariance_type in ('diag', 'sphere'):
-			return torch.sum(self._log_sigma_sqrt_2pi - ((X - self.means) ** 2) 
-				* self._inv_two_sigma, dim=-1)
+
+		logp = torch.zeros(n, dtype=self.means.dtype, device=self.device)
+		patterns, inverse = _mask_patterns(mask)
+
+		for group_id, pattern in enumerate(patterns):
+			idx = inverse == group_id
+			observed = pattern.bool()
+
+			# A fully missing row has an empty observation and therefore a
+			# log probability of zero; it must not be scored as if the
+			# missing entries had been observed as zeros.
+			if not observed.any():
+				continue
+
+			mu_o = self.means[observed]
+			cov_oo = self.covs[observed][:, observed]
+			chol = _safe_cholesky(cov_oo)
+
+			x_o = data[idx][:, observed]
+			diff = x_o - mu_o
+
+			Linv_diff = torch.linalg.solve_triangular(chol, diff.T,
+				upper=False)
+			log_det = torch.log(torch.diagonal(chol)).sum()
+
+			k = observed.sum()
+			logp[idx] = -0.5 * (k * LOG_2_PI +
+				torch.sum(Linv_diff ** 2, dim=0)) - log_det
+
+		return logp
 
 	def summarize(self, X, sample_weight=None):
 		"""Extract the sufficient statistics from a batch of data.
@@ -241,11 +378,20 @@ class Normal(Distribution):
 		value per example or as a 2D matrix of weights for each feature in
 		each example.
 
+		When a `torch.masked.MaskedTensor` is given, the statistics incorporate
+		the missing values through the EM conditional expectations. For each
+		mask pattern the conditional mean of the missing features given the
+		observed ones is used in place of the missing coordinates, and the
+		conditional covariance is added to the weighted second-moment matrix
+		so that the imputation uncertainty is not ignored. Entirely missing
+		rows are imputed with the unconditional mean and covariance and so do
+		not introduce any information beyond the current model itself.
+
 
 		Parameters
 		----------
 		X: list, tuple, numpy.ndarray, torch.Tensor, shape=(-1, self.d)
-			A set of examples to summarize.
+			A set of examples to summarize, optionally as a masked tensor.
 
 		sample_weight: list, tuple, numpy.ndarray, torch.Tensor, optional
 			A set of weights for the examples. This can be either of shape
@@ -258,16 +404,117 @@ class Normal(Distribution):
 		X, sample_weight = super().summarize(X, sample_weight=sample_weight)
 		X = _cast_as_tensor(X, dtype=self.means.dtype)
 		sample_weight = _cast_as_tensor(sample_weight, dtype=self.means.dtype)
-		if self.covariance_type == 'full':
-			self._w_sum += torch.sum(sample_weight, dim=0)
-			self._xw_sum += torch.sum(X * sample_weight, axis=0)
-			self._xxw_sum += torch.matmul((X * sample_weight).T, X)
 
-		elif self.covariance_type in ('diag', 'sphere'):
+		if not isinstance(X, torch.masked.MaskedTensor):
+			if self.covariance_type == 'full':
+				self._w_sum += torch.sum(sample_weight, dim=0)
+				self._xw_sum += torch.sum(X * sample_weight, axis=0)
+				self._xxw_sum += torch.matmul((X * sample_weight).T, X)
+
+			elif self.covariance_type in ('diag', 'sphere'):
+				self._w_sum[:] = self._w_sum + torch.sum(sample_weight, dim=0)
+				self._xw_sum[:] = self._xw_sum + torch.sum(X * sample_weight,
+					dim=0)
+				self._xxw_sum[:] = self._xxw_sum + torch.sum(X ** 2 *
+					sample_weight, dim=0)
+			return
+
+		mask = X._masked_mask
+		data = X._masked_data
+		n, d = mask.shape
+
+		if self.covariance_type in ('diag', 'sphere'):
+			# The features are assumed independent, so a missing feature
+			# simply contributes no information about that feature: masked
+			# arithmetic skips it in every statistic. Fully missing rows
+			# therefore contribute nothing at all rather than a zero-filled
+			# pseudo-observation.
 			self._w_sum[:] = self._w_sum + torch.sum(sample_weight, dim=0)
-			self._xw_sum[:] = self._xw_sum + torch.sum(X * sample_weight, dim=0)
-			self._xxw_sum[:] = self._xxw_sum + torch.sum(X ** 2 * 
+			self._xw_sum[:] = self._xw_sum + torch.sum(X * sample_weight,
+				dim=0)
+			self._xxw_sum[:] = self._xxw_sum + torch.sum(X ** 2 *
 				sample_weight, dim=0)
+			return
+
+		# Full covariance path: reduce the (possibly per-feature) weights to
+		# one scalar weight per example. Per-feature weights are averaged
+		# over the observed features; a fully missing row falls back to the
+		# mean over all features so that its prior-based imputation still
+		# carries the example-level weight that was provided.
+		if isinstance(sample_weight, torch.masked.MaskedTensor):
+			weight_data = sample_weight._masked_data
+			weight_mask = sample_weight._masked_mask
+		else:
+			weight_data = sample_weight
+			weight_mask = mask
+
+		n_observed = weight_mask.sum(dim=1).clamp(min=1)
+		row_weights = (weight_data * weight_mask).sum(dim=1) / n_observed
+		full_missing = ~mask.any(dim=1)
+		if full_missing.any():
+			row_weights[full_missing] = weight_data[full_missing].mean(dim=1)
+
+		# Process each distinct observed-feature pattern once, reusing the
+		# marginal factorization across all rows that share it.
+		patterns, inverse = _mask_patterns(mask)
+
+		w_total = row_weights.sum()
+		xw = torch.zeros(d, dtype=self.means.dtype, device=self.device)
+		xxw = torch.zeros(d, d, dtype=self.means.dtype, device=self.device)
+
+		for group_id, pattern in enumerate(patterns):
+			idx = inverse == group_id
+			observed = pattern.bool()
+			missing = ~observed
+			w_g = row_weights[idx]
+			X_g = data[idx]
+
+			if observed.all():
+				x_imp = X_g
+				cond_cov = None
+			elif not observed.any():
+				# Fully missing rows contribute the unconditional mean and
+				# covariance, i.e. no information beyond the current model.
+				x_imp = self.means.unsqueeze(0).repeat(idx.sum(), 1)
+				cond_cov = self.covs
+			else:
+				cov_oo = self.covs[observed][:, observed]
+				cov_mo = self.covs[missing][:, observed]
+				cov_mm = self.covs[missing][:, missing]
+
+				chol = _safe_cholesky(cov_oo)
+				# Cross-covariance solved against the marginal factor.
+				solved = torch.cholesky_solve(
+					(X_g[:, observed] - self.means[observed]).T, chol).T
+				cond_mean_m = self.means[missing] + solved @ cov_mo.T
+
+				# Conditional covariance of the missing block:
+				# C_mm - C_mo C_oo^{-1} C_om.
+				cond_cov_mm = cov_mm - cov_mo @ torch.cholesky_solve(
+					cov_mo.T, chol)
+				cond_cov_mm = 0.5 * (cond_cov_mm + cond_cov_mm.T)
+
+				x_imp = torch.empty(idx.sum(), d, dtype=self.means.dtype,
+					device=self.device)
+				x_imp[:, observed] = X_g[:, observed]
+				x_imp[:, missing] = cond_mean_m
+
+				cond_cov = torch.zeros(d, d, dtype=self.means.dtype,
+					device=self.device)
+				cond_cov[missing[:, None] & missing[None, :]] = \
+					cond_cov_mm.reshape(-1)
+
+			xw += (x_imp * w_g.unsqueeze(1)).sum(dim=0)
+			xxw += torch.matmul((x_imp * w_g.unsqueeze(1)).T, x_imp)
+			if cond_cov is not None:
+				xxw += w_g.sum() * cond_cov
+
+		# Every example contributes one full (imputed) vector, so the total
+		# weight is the same for every feature even when individual
+		# coordinates were missing.
+		self._w_sum += w_total
+		self._xw_sum += xw
+		self._xxw_sum += xxw
 
 	def from_summaries(self):
 		"""Update the model parameters given the extracted statistics.
@@ -283,17 +530,58 @@ class Normal(Distribution):
 		if self.frozen == True:
 			return
 
-		means = self._xw_sum / self._w_sum
+		# When at least one example contributes, features with zero
+		# accumulated weight are unobserved in every summarized batch: keep
+		# their previous parameters instead of producing NaNs. When nothing
+		# has been summarized at all the original behavior (unprotected
+		# division) is retained.
+		any_weight = self._w_sum.sum() > 0
 
 		if self.covariance_type == 'full':
+			w = self._w_sum
+			w_safe = torch.where(w > 0, w, torch.ones_like(w)) if \
+				any_weight else w
+
+			means = self._xw_sum / w_safe
+
 			v = self._xw_sum.unsqueeze(0) * self._xw_sum.unsqueeze(1)
-			covs = self._xxw_sum / self._w_sum -  v / self._w_sum ** 2.0
+			covs = self._xxw_sum / w_safe - v / w_safe ** 2.0
+
+			if any_weight:
+				unobserved = w <= 0
+				if unobserved.any():
+					means[unobserved] = self.means[unobserved]
+					covs[unobserved, :] = self.covs[unobserved, :]
+					covs[:, unobserved] = self.covs[:, unobserved]
+
+			if self.min_cov is not None:
+				covs = covs + self.min_cov * torch.eye(self.d,
+					dtype=covs.dtype, device=covs.device)
 
 		elif self.covariance_type in ['diag', 'sphere']:
-			covs = self._xxw_sum / self._w_sum - \
-				self._xw_sum ** 2.0 / self._w_sum ** 2.0
+			w = self._w_sum
+			w_safe = torch.where(w > 0, w, torch.ones_like(w)) if \
+				any_weight else w
+			covs = self._xxw_sum / w_safe - \
+				self._xw_sum ** 2.0 / w_safe ** 2.0
+
+			if any_weight:
+				unobserved = w <= 0
+				if unobserved.any():
+					covs[unobserved] = self.covs if \
+						self.covariance_type == 'sphere' else \
+						self.covs[unobserved]
+
+			if self.min_cov is not None:
+				covs = torch.maximum(covs, torch.full_like(covs,
+					float(self.min_cov)))
+
 			if self.covariance_type == 'sphere':
 				covs = covs.mean(dim=-1)
+
+			means = self._xw_sum / w_safe
+			if any_weight and (w <= 0).any():
+				means[w <= 0] = self.means[w <= 0]
 
 		_update_parameter(self.means, means, self.inertia)
 		_update_parameter(self.covs, covs, self.inertia)
