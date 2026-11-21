@@ -1078,3 +1078,300 @@ def test_fit_raises(model, X, w):
 	assert_raises(ValueError, model.fit, [X], [w])
 	assert_raises(ValueError, model.fit, X[:len(X)-1], w)
 	assert_raises(ValueError, model.fit, X, w[:len(w)-1])
+
+
+###
+
+# Chunked and streaming summarization by sequence identity
+
+
+def _sums(model):
+	"""Flatten the cached counts of a model across its distributions."""
+
+	sums = []
+	for distribution in model.distributions:
+		xw_sum = distribution._xw_sum
+
+		if isinstance(xw_sum, list):
+			sums.extend([x.clone() for x in xw_sum])
+		elif hasattr(xw_sum, "buffers"):
+			sums.extend([x.clone() for x in xw_sum.buffers])
+		else:
+			sums.append(xw_sum.clone())
+
+	return sums
+
+
+def _assert_same_sums(a, b):
+	assert len(a) == len(b)
+
+	for x, y in zip(a, b):
+		assert_array_almost_equal(x, y, 5)
+
+
+def test_summarize_chunked_is_equivalent_single(X):
+	X = torch.tensor(X)
+
+	for k in [1, 2, 3]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.summarize(X[0:1])
+
+		for cuts in [[4], [1, 4], [2, 3], [1, 2, 3]]:
+			model = MarkovChain(k=k, n_categories=[3])
+			bounds = [0] + cuts + [len(X[0])]
+
+			for i in range(len(bounds) - 1):
+				chunk = X[0, bounds[i]:bounds[i+1]].reshape(-1, 1)
+				model.summarize(chunk, sequence_ids="a",
+					begin=(i == 0), end=(i == len(bounds) - 2))
+
+			_assert_same_sums(_sums(fused), _sums(model))
+
+
+def test_summarize_chunked_3d_input(X):
+	X = torch.tensor(X)
+
+	for k in [1, 2]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.summarize(X)
+
+		model = MarkovChain(k=k, n_categories=[3])
+		model.summarize(X[:, :2], sequence_ids=range(len(X)), begin=True)
+		model.summarize(X[:, 2:], sequence_ids=range(len(X)), end=True)
+
+		_assert_same_sums(_sums(fused), _sums(model))
+
+
+def test_summarize_chunked_interleaved():
+	X = [[0, 1, 2, 1, 0, 2, 1], [2, 0, 1], [1, 1, 2, 0, 1]]
+	X = [torch.tensor(x).reshape(-1, 1) for x in X]
+
+	for k in [1, 2, 3]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		for x in X:
+			fused.summarize(x.reshape(1, -1, 1))
+
+		model = MarkovChain(k=k, n_categories=[3])
+
+		# Chop every sequence into pieces and feed them in a schedule that
+		# interleaves the sequences with one another.
+		pieces = [list(x.split(2)) for x in X]
+		schedule = []
+		for i in range(max(len(p) for p in pieces)):
+			for j, p in enumerate(pieces):
+				if i < len(p):
+					schedule.append((j, p[i], i == 0, i == len(p) - 1))
+
+		for sequence_id, chunk, is_begin, is_end in schedule:
+			model.summarize(chunk, sequence_ids=sequence_id, begin=is_begin,
+				end=is_end)
+
+		_assert_same_sums(_sums(fused), _sums(model))
+
+
+def test_summarize_chunked_empty_chunks():
+	X = torch.tensor([[0], [1], [2], [1], [0]])
+	empty = torch.zeros(0, 1, dtype=torch.int32)
+
+	for k in [1, 2]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.summarize(X.reshape(1, -1, 1))
+
+		model = MarkovChain(k=k, n_categories=[3])
+		model.summarize(empty, sequence_ids=0, begin=True)
+		model.summarize(X[:2], sequence_ids=0)
+		model.summarize(empty, sequence_ids=0)
+		model.summarize(X[2:], sequence_ids=0, end=True)
+		model.summarize(empty, sequence_ids=1, begin=True, end=True)
+
+		_assert_same_sums(_sums(fused), _sums(model))
+
+
+def test_summarize_chunked_weights():
+	X = torch.tensor([[[1], [2], [0], [0]], [[0], [0], [1], [1]],
+		[[1], [1], [2], [0]], [[2], [2], [2], [1]]])
+
+	for k in [1, 2]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.summarize(X, sample_weight=torch.tensor([1., 2., 0., 5.]))
+
+		model = MarkovChain(k=k, n_categories=[3])
+		for i in range(4):
+			model.summarize(X[i], sample_weight=torch.tensor([1., 2., 0., 5.])[i],
+				sequence_ids=i, begin=True, end=True)
+
+		# Splitting each sequence with per-observation weights should match as
+		# well, because a window is weighted by the observation it predicts.
+		split = MarkovChain(k=k, n_categories=[3])
+		for i in range(4):
+			sequence = X[i]
+			weight = torch.ones(len(sequence)) * torch.tensor([1., 2., 0., 5.])[i]
+			split.summarize(sequence[:2], sample_weight=weight[:2],
+				sequence_ids=i, begin=True)
+			split.summarize(sequence[2:], sample_weight=weight[2:],
+				sequence_ids=i, end=True)
+
+		_assert_same_sums(_sums(fused), _sums(model))
+		_assert_same_sums(_sums(fused), _sums(split))
+
+		_assert_same_sums(_sums(fused), _sums(model))
+
+
+def test_summarize_chunked_state():
+	X = torch.tensor([[0], [1], [2], [1], [0]])
+
+	for k in [1, 2]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.summarize(X.reshape(1, -1, 1))
+
+		model = MarkovChain(k=k, n_categories=[3])
+		model.summarize(X[:1], sequence_ids=4, state="begin")
+		model.summarize(X[1:3], sequence_ids=4, state="continue")
+		model.summarize(X[3:], sequence_ids=4, state="end")
+
+		_assert_same_sums(_sums(fused), _sums(model))
+
+	assert_raises(ValueError, MarkovChain(k=1).summarize, X[:1],
+		state="begin", begin=True)
+	assert_raises(ValueError, MarkovChain(k=1).summarize, X[:1], state="x")
+
+
+def test_summarize_chunked_from_summaries(X):
+	X = torch.tensor(X)
+
+	for k in [1, 2]:
+		fused = MarkovChain(k=k, n_categories=[3])
+		fused.fit(X)
+
+		model = MarkovChain(k=k, n_categories=[3])
+		for i in range(len(X)):
+			model.summarize(X[i, :2].reshape(-1, 1), sequence_ids=i,
+				begin=True)
+			model.summarize(X[i, 2:].reshape(-1, 1), sequence_ids=i, end=True)
+
+		model.from_summaries()
+
+		for a, b in zip(fused.distributions, model.distributions):
+			assert_array_almost_equal(a.probs[0] if isinstance(
+				a.probs, torch.nn.ParameterList) else a.probs, b.probs[0]
+				if isinstance(b.probs, torch.nn.ParameterList) else b.probs, 4)
+
+
+def test_summarize_chunked_save_restore():
+	X = torch.tensor([[1], [2], [0], [0], [1], [1], [2], [0]])
+
+	for k in [1, 2]:
+		model = MarkovChain(k=k, n_categories=[3])
+		model.summarize(X[:3], sequence_ids=7, begin=True)
+
+		restored = MarkovChain(k=k, n_categories=[3])
+		restored.summarize(X[:1], sequence_ids=100, begin=True)
+		restored.from_summaries()
+		restored.load_state_dict(model.state_dict())
+
+		model.summarize(X[3:], sequence_ids=7, end=True)
+		restored.summarize(X[3:], sequence_ids=7, end=True)
+
+		_assert_same_sums(_sums(model), _sums(restored))
+
+		# Pickling the whole object keeps the context as well.
+		reference = MarkovChain(k=k, n_categories=[3])
+		reference.summarize(X.reshape(1, -1, 1))
+
+		model = MarkovChain(k=k, n_categories=[3])
+		model.summarize(X[:4], sequence_ids="s", begin=True)
+
+		torch.save(model, ".pytest.torch")
+		model2 = torch.load(".pytest.torch", weights_only=False)
+		model2.summarize(X[4:], sequence_ids="s", end=True)
+
+		_assert_same_sums(_sums(reference), _sums(model2))
+
+
+def test_summarize_chunked_rejects_schema_change():
+	X = torch.tensor([[0], [1], [2]])
+
+	model = MarkovChain(k=1, n_categories=[3])
+	model.summarize(X, sequence_ids=0, begin=True)
+	model.k = torch.tensor(2)
+
+	assert_raises(ValueError, model.summarize, X, sequence_ids=0)
+
+	model = MarkovChain(k=1, n_categories=[3])
+	model.summarize(X, sequence_ids=0, begin=True)
+	model.n_categories = torch.tensor([4])
+
+	assert_raises(ValueError, model.summarize, X, sequence_ids=0)
+
+	# Clearing the context allows the new schema to be used.
+	model.clear_context()
+	model.summarize(X, sequence_ids=0)
+	assert len(_sums(model)) == 2
+
+
+def test_summarize_chunked_clear_context():
+	X = torch.tensor([[0], [1], [2]])
+
+	model = MarkovChain(k=1, n_categories=[3])
+	model.summarize(X, sequence_ids="a", begin=True)
+	assert "a" in model._sequence_context
+
+	model.clear_context("a")
+	assert "a" not in model._sequence_context
+
+	model.summarize(X, sequence_ids="a", begin=True)
+	model.clear_context()
+	assert len(model._sequence_context) == 0
+
+
+def test_summarize_chunked_raises():
+	X = torch.tensor([[0], [1], [2]])
+
+	model = MarkovChain(k=1, n_categories=[3])
+	assert_raises(ValueError, model.summarize, X, sequence_ids=[0, 0])
+	assert_raises(ValueError, model.summarize, X, begin=[True, False])
+	assert_raises(ValueError, model.summarize, [X], sequence_ids=0,
+		sample_weight=[1.0, 2.0])
+	assert_raises(ValueError, model.summarize, X, sequence_ids=0,
+		sample_weight=torch.ones(2, 1))
+
+
+def test_summarize_chunked_legacy_matches_weighted(model, X, w):
+	# The classic 3D call must keep behaving exactly as before.
+	model.summarize(torch.tensor(X), sample_weight=w)
+
+	assert_array_almost_equal(model.distributions[0]._xw_sum, [[9., 4., 2.]])
+	assert_array_almost_equal(model.distributions[1]._xw_sum[0],
+		[[2., 5., 2.],
+         [1., 2., 1.],
+         [0., 2., 0.]])
+	assert_array_almost_equal(model.distributions[2]._xw_sum[0],
+		[[[0., 2., 0.],
+          [5., 2., 0.],
+          [0., 3., 0.]],
+
+         [[6., 3., 1.],
+          [2., 0., 0.],
+          [1., 0., 0.]],
+
+         [[1., 0., 0.],
+          [4., 0., 0.],
+          [0., 0., 0.]]])
+
+
+def test_summarize_chunked_multifeature_weights():
+	X = torch.tensor([[[0, 1], [1, 0], [2, 2]], [[2, 2], [1, 1], [0, 0]]])
+	w = torch.tensor([[2., 3.], [4., 5.]])
+
+	fused = MarkovChain(k=1, n_categories=[3, 3])
+	fused.summarize(X, sample_weight=w)
+
+	model = MarkovChain(k=1, n_categories=[3, 3])
+	for i in range(len(X)):
+		model.summarize(X[i], sample_weight=w[i], sequence_ids=i,
+			begin=True, end=True)
+
+	_assert_same_sums(_sums(fused), _sums(model))
+
+	assert_array_almost_equal(model.distributions[0]._xw_sum, 
+		[[2., 0., 4.], [0., 3., 5.]])

@@ -27,6 +27,8 @@ Yes! Almost all algorithms in pomegranate can operate on incomplete data sets. A
 
 Once a model has been initialized the ``summarize`` method can be used on arbitrarily sized chunks of the data to reduce them into their sufficient statistics. These sufficient statistics are additive, meaning that if they are calculated for all chunks of a dataset and then added together they can yield exact updates. Once all chunks have been summarized then ``from_summaries`` is called to update the parameters of the model based on these added sufficient statistics. Out-of-core computing is supported by allowing the user to load up chunks of data from memory, summarize it, discard it, and move on to the next chunk.
 
+Chunking sequential data, such as data for a ``MarkovChain``, requires a little more care because the transitions that span a chunk boundary would otherwise be lost. For this reason, ``MarkovChain.summarize`` and ``MarkovChain.fit`` accept ``sequence_ids`` along with ``begin``/``end`` (or a single ``state`` value of ``'begin'``, ``'continue'``, or ``'end'``) so that chunks belonging to the same sequence are recognized and the last ``k`` observations are kept as context. This makes any chunking exactly equivalent to a single call on the full sequences, including for several interleaved sequences.
+
 **Does pomegranate support parallelization?**
 
 Yes! Because pomegranate v1.0.0 is written in PyTorch which is natively multithreaded, all algorithms will use the available threads. See PyTorch documentation for controlling the number of threads to use.

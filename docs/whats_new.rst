@@ -5,6 +5,26 @@
 Release History
 ===============
 
+Version 1.1.2
+==============
+
+
+Highlights
+----------
+
+	- Added sequence-aware chunked summarization to `MarkovChain`. Each chunk
+	can be tagged with the identity of the sequence it is a piece of and
+	whether it begins, continues, or ends that sequence through the new
+	`sequence_ids`, `begin`, `end`, and `state` parameters of `summarize`
+	and `fit`. The last `k` observations of every sequence are retained as
+	context so that transitions spanning a chunk boundary are counted exactly
+	once, weights follow the true observation each window predicts, empty
+	chunks never create transitions, and interleaved sequences never share
+	context. Stored context is part of the serialized state, can be cleared
+	with `clear_context`, and is rejected when the order or category schema
+	of the model changes.
+
+
 Version 1.1.1
 ==============
 
